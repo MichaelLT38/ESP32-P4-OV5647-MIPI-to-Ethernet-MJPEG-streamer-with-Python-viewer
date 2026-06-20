@@ -66,10 +66,36 @@ menu "Example Configuration"
 
     config EXAMPLE_JPEG_QUALITY
         int "JPEG encode quality (1-100)"
-        default 80
+        default 85
         range 1 100
         help
             Hardware JPEG encoder quality factor. Higher = better image but
-            larger frames / more bandwidth. 80 is a good balance for a
-            1080p MJPEG stream over 100 Mbps Ethernet.
+            larger frames / more bandwidth. 85 is a good balance for a
+            1280x960 MJPEG stream over 100 Mbps Ethernet.
+
+    config EXAMPLE_ISP_TUNING_ENABLE
+        bool "Enable ISP image-quality tuning (denoise / gamma / CCM / sharpen)"
+        default y
+        help
+            Turn on the optional ISP processing blocks (Bayer denoise, demosaic
+            gradient, gamma, color-correction matrix, light sharpening) for a
+            cleaner, more natural picture. Disable to compare against the raw
+            demosaic-only output. Black-level correction (BLC) is not included
+            because it needs ESP32-P4 chip rev >= v3.0.
+
+    config EXAMPLE_UDP_DEST_IP
+        string "Destination IP for the UDP video stream (your PC running the viewer)"
+        default "192.168.1.100"
+        help
+            IPv4 address the firmware sends the MJPEG stream to. Set this to the
+            IP of the PC running tools/viewer_win.py (or recorder_nas.py). The
+            real value lives in your local sdkconfig (gitignored), so it is not
+            published. Change it with `idf.py menuconfig`.
+
+    config EXAMPLE_UDP_DEST_PORT
+        int "Destination UDP port"
+        default 12345
+        range 1 65535
+        help
+            UDP port the viewer/recorder listens on.
 endmenu

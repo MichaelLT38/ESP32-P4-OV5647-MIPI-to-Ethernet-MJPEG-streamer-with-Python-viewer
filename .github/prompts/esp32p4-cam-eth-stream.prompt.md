@@ -15,11 +15,11 @@ description: >
 | Board | Waveshare ESP32-P4 |
 | SoC | ESP32-P4, RISC-V, 360 MHz, 32 MB PSRAM |
 | Camera | OV5647, MIPI CSI-2, 2-lane, I²C on SDA=GPIO7/SCL=GPIO8 |
-| Active mode | `MIPI_2lane_24Minput_RAW8_800x640_50fps` |
-| Bayer pattern | **BGGR** |
+| Active mode | `MIPI_2lane_24Minput_RAW10_1280x960_binning_45fps` |
+| Bayer pattern | **GBRG** (set via ISP `bayer_order`) |
 | Network | 100 Mbps Ethernet, generic PHY (`esp_eth_phy_new_generic`), DHCP |
-| ESP32 IP | 192.168.0.75 (DHCP, may change) |
-| PC IP | 192.168.0.94, UDP port 12345 |
+| ESP32 IP | DHCP (varies) |
+| PC IP | set via `EXAMPLE_UDP_DEST_IP` in menuconfig, UDP port 12345 |
 
 ## Software environment
 

@@ -99,16 +99,17 @@ Key compile-time settings:
 
 | Setting | Where | Default |
 | ------- | ----- | ------- |
-| UDP destination IP | `UDP_DEST_IP` in [main/cam_csi_eth_stream_main.c](main/cam_csi_eth_stream_main.c) | `192.168.0.94` |
-| UDP destination port | `UDP_DEST_PORT` | `12345` |
-| UDP chunk size | `UDP_CHUNK_SIZE` | `1400` |
-| Camera resolution | `menuconfig` → *Example Configuration* | 1920 × 1080 |
-| Camera format | derived in [main/example_config.h](main/example_config.h) | RAW10 30 fps |
-| CSI lane bitrate | `EXAMPLE_MIPI_CSI_LANE_BITRATE_MBPS` | 204 Mbps (1080p) |
-| JPEG quality | `menuconfig` → *Example Configuration* (`EXAMPLE_JPEG_QUALITY`) | 80 (1–100) |
+| UDP destination IP | `menuconfig` → *Example Configuration* (`EXAMPLE_UDP_DEST_IP`) | `192.168.1.100` (set to your PC) |
+| UDP destination port | `menuconfig` → *Example Configuration* (`EXAMPLE_UDP_DEST_PORT`) | `12345` |
+| UDP chunk size | `UDP_CHUNK_SIZE` in [main/cam_csi_eth_stream_main.c](main/cam_csi_eth_stream_main.c) | `1400` |
+| Camera resolution | `menuconfig` → *Example Configuration* | 1280 × 960 (binning) |
+| Camera format | derived in [main/example_config.h](main/example_config.h) | RAW10 45 fps |
+| CSI lane bitrate | `EXAMPLE_MIPI_CSI_LANE_BITRATE_MBPS` | 221 Mbps (1280×960) |
+| JPEG quality | `menuconfig` → *Example Configuration* (`EXAMPLE_JPEG_QUALITY`) | 85 (1–100) |
 | MIPI PHY LDO | `menuconfig` → *Example Configuration* | chan 3, 2500 mV |
 
-The board obtains its IP via DHCP; the firmware waits for an address before
+Set `EXAMPLE_UDP_DEST_IP` to the IP of the PC running the viewer/recorder. The
+board obtains its own IP via DHCP; the firmware waits for an address before
 starting the stream.
 
 ## Build, flash, monitor

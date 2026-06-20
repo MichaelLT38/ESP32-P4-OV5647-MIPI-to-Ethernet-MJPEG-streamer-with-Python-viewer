@@ -33,6 +33,7 @@
 #include <string.h>
 #include <errno.h>
 #include <inttypes.h>
+#include <math.h>
 #include "sdkconfig.h"
 #include "esp_attr.h"
 #include "esp_log.h"
@@ -58,8 +59,8 @@
 
 static const char *TAG = "cam_eth";
 
-#define UDP_DEST_IP     "192.168.0.94"
-#define UDP_DEST_PORT   12345
+#define UDP_DEST_IP     CONFIG_EXAMPLE_UDP_DEST_IP
+#define UDP_DEST_PORT   CONFIG_EXAMPLE_UDP_DEST_PORT
 #define UDP_CHUNK_SIZE  1400   /* one Ethernet frame — avoids IP fragmentation */
 
 #define JPEG_QUALITY    CONFIG_EXAMPLE_JPEG_QUALITY
@@ -274,6 +275,89 @@ static void encode_send_task(void *arg)
 }
 
 /* ------------------------------------------------------------------ */
+/* ISP image-quality tuning                                            */
+/* ------------------------------------------------------------------ */
+#if CONFIG_EXAMPLE_ISP_TUNING_ENABLE
+/* Gamma curve: y = (x/256)^0.7 * 256. Lifts midtones/shadows so the image
+ * isn't dark and flat — the single biggest perceptual improvement for an
+ * uncorrected RAW sensor. (Same curve as Espressif's ISP pipeline example.) */
+static uint32_t s_gamma_curve(uint32_t x)
+{
+    return (uint32_t)(pow((double)x / 256.0, 0.7) * 256.0);
+}
+
+/* Enable the optional ISP processing blocks. Called once, after esp_isp_enable.
+ * Each block is configure() then enable(); failures are logged but non-fatal so
+ * a bad tweak never bricks the stream. Values are conservative starting points
+ * (from the IDF ISP example) — tune on the bench to taste.
+ * NOTE: BLC (black-level) is intentionally omitted: it requires ESP32-P4 chip
+ * rev >= v3.0 and this board is v1.3, so the driver returns NOT_SUPPORTED. */
+static void configure_isp_tuning(isp_proc_handle_t isp)
+{
+    esp_err_t r;
+
+    /* Demosaic gradient ratio — cleaner edge interpolation (less "zipper"). */
+    esp_isp_demosaic_config_t demo = {
+        .grad_ratio   = { .integer = 2, .decimal = 5 },
+        .padding_mode = ISP_DEMOSAIC_EDGE_PADDING_MODE_SRND_DATA,
+    };
+    r = esp_isp_demosaic_configure(isp, &demo);
+    if (r == ESP_OK) r = esp_isp_demosaic_enable(isp);
+    ESP_LOGI(TAG, "ISP demosaic: %s", esp_err_to_name(r));
+
+    /* Bayer-domain denoise — directly reduces sensor noise. level 2..20;
+     * 5 with a Gaussian template keeps detail while smoothing grain. */
+    esp_isp_bf_config_t bf = {
+        .denoising_level = 5,
+        .padding_mode    = ISP_BF_EDGE_PADDING_MODE_SRND_DATA,
+        .bf_template     = { {1, 2, 1}, {2, 4, 2}, {1, 2, 1} },
+    };
+    r = esp_isp_bf_configure(isp, &bf);
+    if (r == ESP_OK) r = esp_isp_bf_enable(isp);
+    ESP_LOGI(TAG, "ISP denoise (BF): %s", esp_err_to_name(r));
+
+    /* Color Correction Matrix — identity for now (neutral). This is the hook
+     * to fix any color cast / boost saturation once measured on the bench. */
+    esp_isp_ccm_config_t ccm = {
+        .matrix = { {1.0f, 0.0f, 0.0f},
+                    {0.0f, 1.0f, 0.0f},
+                    {0.0f, 0.0f, 1.0f} },
+        .saturation = false,
+    };
+    r = esp_isp_ccm_configure(isp, &ccm);
+    if (r == ESP_OK) r = esp_isp_ccm_enable(isp);
+    ESP_LOGI(TAG, "ISP CCM: %s", esp_err_to_name(r));
+
+    /* Gamma correction on all three channels. */
+    isp_gamma_curve_points_t pts = {0};
+    if (esp_isp_gamma_fill_curve_points(s_gamma_curve, &pts) == ESP_OK) {
+        esp_isp_gamma_configure(isp, COLOR_COMPONENT_R, &pts);
+        esp_isp_gamma_configure(isp, COLOR_COMPONENT_G, &pts);
+        esp_isp_gamma_configure(isp, COLOR_COMPONENT_B, &pts);
+        r = esp_isp_gamma_enable(isp);
+    } else {
+        r = ESP_FAIL;
+    }
+    ESP_LOGI(TAG, "ISP gamma: %s", esp_err_to_name(r));
+
+    /* Light sharpening — improves legibility of plates/faces. Kept mild
+     * (h_thresh high so only strong edges are boosted) to avoid amplifying
+     * the noise the BF stage just removed. */
+    esp_isp_sharpen_config_t sh = {
+        .h_freq_coeff     = { .integer = 1, .decimal = 0 },
+        .m_freq_coeff     = { .integer = 1, .decimal = 0 },
+        .h_thresh         = 255,
+        .l_thresh         = 0,
+        .padding_mode     = ISP_SHARPEN_EDGE_PADDING_MODE_SRND_DATA,
+        .sharpen_template = { {1, 2, 1}, {2, 4, 2}, {1, 2, 1} },
+    };
+    r = esp_isp_sharpen_configure(isp, &sh);
+    if (r == ESP_OK) r = esp_isp_sharpen_enable(isp);
+    ESP_LOGI(TAG, "ISP sharpen: %s", esp_err_to_name(r));
+}
+#endif /* CONFIG_EXAMPLE_ISP_TUNING_ENABLE */
+
+/* ------------------------------------------------------------------ */
 /* app_main — capture loop                                             */
 /* ------------------------------------------------------------------ */
 void app_main(void)
@@ -388,6 +472,11 @@ void app_main(void)
         .has_line_end_packet    = false,
         .h_res                  = CONFIG_EXAMPLE_MIPI_CSI_DISP_HRES,
         .v_res                  = CONFIG_EXAMPLE_MIPI_CSI_DISP_VRES,
+        /* MUST match the sensor's Bayer order or demosaic produces wrong colors
+         * (strong green cast, greens↔magenta, blues lost). The OV5647 driver
+         * declares ESP_CAM_SENSOR_BAYER_GBRG for every format (incl. 1280x960
+         * binning), so the ISP must read GBRG. Default (0) is BGGR — wrong. */
+        .bayer_order            = COLOR_RAW_ELEMENT_ORDER_GBRG,
     };
     ESP_ERROR_CHECK(esp_isp_new_processor(&isp_config, &isp_proc));
 
@@ -413,6 +502,12 @@ void app_main(void)
     if (ret != ESP_OK) { ESP_LOGE(TAG, "CSI init failed [%d]", ret); return; }
 
     ESP_ERROR_CHECK(esp_isp_enable(isp_proc));
+
+#if CONFIG_EXAMPLE_ISP_TUNING_ENABLE
+    /* Turn on the optional ISP blocks (denoise / gamma / CCM / sharpen) now
+     * that the processor is enabled. Non-fatal: a bad tweak won't stop the stream. */
+    configure_isp_tuning(isp_proc);
+#endif
 
     /* Callback mode:
      *   on_get_new_trans  — ISR calls this to get the buffer for the NEXT DMA.
