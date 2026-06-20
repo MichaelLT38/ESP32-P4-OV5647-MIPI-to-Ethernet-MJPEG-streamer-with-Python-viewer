@@ -150,6 +150,13 @@ self-describing. Make sure any firewall allows UDP on the chosen port.
   python3 tools/recorder_nas.py --port 12345 --outdir /tmp/frames
   ```
 
+## Sample capture
+
+A color test chart received over the stream, used to verify the ISP demosaic
+and Bayer order (GBRG) produce correct hues:
+
+![Color test chart captured from the stream](image/image.jpg)
+
 ## Project layout
 
 ```
