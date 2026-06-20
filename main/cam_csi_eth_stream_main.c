@@ -3,19 +3,30 @@
  *
  * SPDX-License-Identifier: Apache-2.0
  *
- * Camera pipeline: MIPI CSI → ISP (RAW8 passthrough) → Ethernet UDP
- * No DSI display used.
+ * Camera pipeline: MIPI CSI (RAW10) → ISP (RAW10 → RGB565) → hardware JPEG
+ *                  (RGB565 in, 4:2:0 out) → Ethernet UDP (MJPEG)
+ * No DSI display used. Target: 1920x1080 @ 30fps.
+ *
+ * Why RGB565 into the JPEG encoder (not YUV422 directly):
+ *   The ESP32-P4 ISP emits YUV422 in UYVY byte order, while the JPEG encoder's
+ *   YUV422 input expects YVYU — a byte-order mismatch whose reorder path is
+ *   chip-revision dependent. ISP→RGB565→JPEG is the configuration Espressif's
+ *   official OV5647 test verifies, and the JPEG OUTPUT is still 4:2:0 YUV, so
+ *   compression and quality are unchanged. To switch to a YUV422 encoder input
+ *   later, change ISP output to ISP_COLOR_YUV422 and the JPEG src_type to
+ *   JPEG_ENCODE_IN_FORMAT_YUV422 (and verify colors on hardware).
  *
  * Architecture:
  *   - Two PSRAM DMA buffers (s_dbl.buf[0/1]): camera alternates between them
- *   - One PSRAM copy buffer (s_send_buf): snapshot of the latest completed frame
- *   - Capture task (main): calls receive() continuously, copies to s_send_buf
- *     when the send task is idle, drops frame otherwise
- *   - Send task: waits for a semaphore, sends s_send_buf over UDP, signals done
- *
- *   This ensures esp_cam_ctlr_receive() is ALWAYS called promptly so the
- *   camera pipeline never stalls, even though sending a full frame takes
- *   ~60ms over 100 Mbps Ethernet (camera runs at 50fps = 20ms/frame).
+ *     (callback mode — the ISR re-arms the next buffer autonomously).
+ *   - One PSRAM snapshot buffer (s_enc_src): copy of the latest completed frame,
+ *     used as the JPEG encoder input so the camera can keep reusing its DMA
+ *     buffers while we encode.
+ *   - One PSRAM JPEG output buffer (s_jpeg_buf): holds the compressed bitstream.
+ *   - Capture task (main): snapshots a completed frame into s_enc_src when the
+ *     encode/send task is idle, drops the frame otherwise.
+ *   - Encode/send task: JPEG-encodes s_enc_src, then streams the compressed
+ *     bytes over UDP in 1400-byte chunks.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -26,12 +37,14 @@
 #include "esp_attr.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
+#include "esp_cache.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "freertos/event_groups.h"
 #include "driver/i2c_master.h"
 #include "driver/isp.h"
+#include "driver/jpeg_encode.h"
 #include "esp_ldo_regulator.h"
 #include "esp_cam_ctlr_csi.h"
 #include "esp_cam_ctlr.h"
@@ -49,7 +62,11 @@ static const char *TAG = "cam_eth";
 #define UDP_DEST_PORT   12345
 #define UDP_CHUNK_SIZE  1400   /* one Ethernet frame — avoids IP fragmentation */
 
-/* Header prepended to every UDP datagram */
+#define JPEG_QUALITY    CONFIG_EXAMPLE_JPEG_QUALITY
+
+/* Header prepended to every UDP datagram. frame_bytes is the size of the whole
+ * compressed JPEG for this frame; the receiver reassembles total_chunks chunks
+ * then decodes the JPEG. */
 typedef struct __attribute__((packed)) {
     uint32_t frame_num;
     uint16_t chunk_idx;
@@ -59,22 +76,31 @@ typedef struct __attribute__((packed)) {
 } frame_chunk_hdr_t;
 
 /* ------------------------------------------------------------------ */
-/* Double-buffer state — shared between ISR and capture task          */
+/* Triple-buffer state — shared between ISR and capture task          */
 /* ------------------------------------------------------------------ */
+/* Three DMA buffers (instead of two) give the encoder a 2-frame safety
+ * margin: by the time the camera round-robins back to a buffer, the JPEG
+ * encode that read it has long finished. This eliminates the mid-frame
+ * "tear" that two buffers produced once per-frame work exceeded one frame
+ * period, and lets us encode straight from the DMA buffer (zero-copy). */
+#define NUM_FRAME_BUFFERS 3
 static struct {
-    void   *buf[2];   /* two PSRAM DMA buffers */
+    void   *buf[NUM_FRAME_BUFFERS]; /* PSRAM DMA buffers (RGB565 frames) */
     size_t  buflen;
     int     next_idx; /* which buf[] the ISR hands to the camera next */
 } s_dbl;
 
 /* ------------------------------------------------------------------ */
-/* Send-task shared state                                              */
+/* Encode/send-task shared state                                       */
 /* ------------------------------------------------------------------ */
-static void           *s_send_buf;     /* PSRAM copy buffer           */
-static size_t          s_send_len;
+static void           *s_enc_ptr;      /* DMA buffer to encode (zero-copy)  */
+static size_t          s_enc_len;      /* valid bytes in s_enc_ptr          */
 static uint32_t        s_send_frame;
-static SemaphoreHandle_t s_rdy;        /* capture task → send task    */
-static SemaphoreHandle_t s_done;       /* send task → capture task    */
+static jpeg_encoder_handle_t s_jpeg;   /* hardware JPEG encoder            */
+static uint8_t        *s_jpeg_buf;     /* PSRAM compressed-output buffer   */
+static size_t          s_jpeg_buf_cap; /* capacity of s_jpeg_buf           */
+static SemaphoreHandle_t s_rdy;        /* capture task → encode/send task  */
+static SemaphoreHandle_t s_done;       /* encode/send task → capture task  */
 /* ISR → capture task: pointer to the latest completed DMA buffer    */
 static QueueHandle_t      s_frame_q;
 
@@ -89,15 +115,16 @@ static EventGroupHandle_t s_eth_eg;
 /* ------------------------------------------------------------------ */
 
 /* Called by the ISR to get the buffer for the NEXT DMA transfer.
- * Alternates between buf[0] and buf[1] so one buffer is always
- * available while the other is being read by the capture task. */
+ * Round-robins through the three buffers so a buffer handed to the
+ * encoder is not reused by the camera until two more frames have
+ * elapsed (~44 ms @ 45fps) — far longer than a JPEG encode. */
 static bool IRAM_ATTR s_camera_get_new_vb(esp_cam_ctlr_handle_t handle,
                                            esp_cam_ctlr_trans_t *trans,
                                            void *user_data)
 {
     trans->buffer = s_dbl.buf[s_dbl.next_idx];
     trans->buflen = s_dbl.buflen;
-    s_dbl.next_idx ^= 1;
+    s_dbl.next_idx = (s_dbl.next_idx + 1) % NUM_FRAME_BUFFERS;
     return false;
 }
 
@@ -159,15 +186,15 @@ static void init_ethernet(void)
 }
 
 /* ------------------------------------------------------------------ */
-/* Send task — runs at lower priority than capture loop               */
+/* Encode + send task — runs at lower priority than capture loop      */
 /* ------------------------------------------------------------------ */
-static void send_task(void *arg)
+static void encode_send_task(void *arg)
 {
     struct sockaddr_in *dest = (struct sockaddr_in *)arg;
 
     int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (sock < 0) {
-        ESP_LOGE(TAG, "send_task: socket failed (errno=%d)", errno);
+        ESP_LOGE(TAG, "encode_send_task: socket failed (errno=%d)", errno);
         vTaskDelete(NULL);
         return;
     }
@@ -176,22 +203,42 @@ static void send_task(void *arg)
     uint8_t *pkt = heap_caps_malloc(sizeof(frame_chunk_hdr_t) + UDP_CHUNK_SIZE,
                                     MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if (!pkt) {
-        ESP_LOGE(TAG, "send_task: pkt alloc failed");
+        ESP_LOGE(TAG, "encode_send_task: pkt alloc failed");
         vTaskDelete(NULL);
         return;
     }
-    ESP_LOGI(TAG, "send_task ready, pkt buf @ %p", pkt);
+    ESP_LOGI(TAG, "encode_send_task ready, pkt buf @ %p", pkt);
 
     /* Signal capture task that we are ready */
     xSemaphoreGive(s_done);
 
     for (;;) {
-        /* Wait for capture task to hand us a frame */
+        /* Wait for capture task to hand us a frame snapshot */
         xSemaphoreTake(s_rdy, portMAX_DELAY);
 
-        const uint8_t *src       = (const uint8_t *)s_send_buf;
-        size_t         remaining = s_send_len;
-        uint32_t       fn        = s_send_frame;
+        uint32_t fn = s_send_frame;
+
+        /* --- Hardware JPEG encode: RGB565 in → 4:2:0 JPEG out --- */
+        jpeg_encode_cfg_t enc_cfg = {
+            .src_type      = JPEG_ENCODE_IN_FORMAT_RGB565,
+            .sub_sample    = JPEG_DOWN_SAMPLING_YUV420,
+            .image_quality = JPEG_QUALITY,
+            .width         = CONFIG_EXAMPLE_MIPI_CSI_DISP_HRES,
+            .height        = CONFIG_EXAMPLE_MIPI_CSI_DISP_VRES,
+        };
+        uint32_t jpeg_size = 0;
+        esp_err_t err = jpeg_encoder_process(s_jpeg, &enc_cfg,
+                                             (const uint8_t *)s_enc_ptr, s_enc_len,
+                                             s_jpeg_buf, s_jpeg_buf_cap, &jpeg_size);
+        if (err != ESP_OK || jpeg_size == 0) {
+            ESP_LOGW(TAG, "JPEG encode failed (frame %" PRIu32 ", err=%d)", fn, err);
+            xSemaphoreGive(s_done);
+            continue;
+        }
+
+        /* --- Stream the compressed JPEG over UDP in chunks --- */
+        const uint8_t *src       = s_jpeg_buf;
+        size_t         remaining = jpeg_size;
         uint16_t       total     = (uint16_t)((remaining + UDP_CHUNK_SIZE - 1) / UDP_CHUNK_SIZE);
         uint16_t       idx       = 0;
 
@@ -202,7 +249,7 @@ static void send_task(void *arg)
                 .frame_num    = fn,
                 .chunk_idx    = idx,
                 .total_chunks = total,
-                .frame_bytes  = (uint32_t)s_send_len,
+                .frame_bytes  = jpeg_size,
                 .chunk_bytes  = (uint32_t)cb,
             };
             memcpy(pkt,              &hdr, sizeof(hdr));
@@ -221,7 +268,7 @@ static void send_task(void *arg)
             idx++;
         }
 
-        ESP_LOGI(TAG, "Frame %" PRIu32 ": sent %zu B (%d chunks)", fn, s_send_len, total);
+        ESP_LOGI(TAG, "Frame %" PRIu32 ": JPEG %" PRIu32 " B (%d chunks)", fn, jpeg_size, total);
         xSemaphoreGive(s_done);   /* tell capture task we're done */
     }
 }
@@ -235,22 +282,48 @@ void app_main(void)
 
     init_ethernet();
 
-    /* Three PSRAM buffers: two for double-buffered DMA, one for send copy */
+    /* Frame buffers hold RGB565 (ISP output) = 2 bytes/pixel.
+     * Three for triple-buffered CSI DMA; the JPEG encoder reads one of them
+     * directly (zero-copy) — no separate snapshot buffer / memcpy needed. */
     size_t fb_size = (size_t)CONFIG_EXAMPLE_MIPI_CSI_DISP_HRES
-                   * (size_t)CONFIG_EXAMPLE_MIPI_CSI_DISP_VRES;  /* RAW8 = 1 B/px */
+                   * (size_t)CONFIG_EXAMPLE_MIPI_CSI_DISP_VRES
+                   * 2;  /* RGB565 = 2 B/px */
 
-    s_dbl.buf[0] = heap_caps_aligned_alloc(64, fb_size, MALLOC_CAP_SPIRAM);
-    s_dbl.buf[1] = heap_caps_aligned_alloc(64, fb_size, MALLOC_CAP_SPIRAM);
-    s_send_buf   = heap_caps_aligned_alloc(64, fb_size, MALLOC_CAP_SPIRAM);
-    if (!s_dbl.buf[0] || !s_dbl.buf[1] || !s_send_buf) {
-        ESP_LOGE(TAG, "Frame buffer alloc failed (need 3 × %zu B PSRAM)", fb_size);
+    /* --- Hardware JPEG encoder engine (created before its input buffers) --- */
+    jpeg_encode_engine_cfg_t jpeg_eng_cfg = {
+        .intr_priority = 0,
+        .timeout_ms    = 100,   /* ample for one 1080p frame at 30 fps */
+    };
+    ret = jpeg_new_encoder_engine(&jpeg_eng_cfg, &s_jpeg);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "JPEG encoder engine init failed [%d]", ret);
+        return;
+    }
+
+    /* JPEG output buffer — half the raw size is far more than q80 1080p needs
+     * (~200-400 KB), but generous keeps us safe against busy/noisy scenes. */
+    jpeg_encode_memory_alloc_cfg_t enc_out_cfg = {
+        .buffer_direction = JPEG_ENC_ALLOC_OUTPUT_BUFFER,
+    };
+    size_t jpeg_out_alloc = 0;
+    s_jpeg_buf     = jpeg_alloc_encoder_mem(fb_size / 2, &enc_out_cfg, &jpeg_out_alloc);
+    s_jpeg_buf_cap = jpeg_out_alloc;
+
+    bool dma_ok = true;
+    for (int i = 0; i < NUM_FRAME_BUFFERS; i++) {
+        s_dbl.buf[i] = heap_caps_aligned_alloc(64, fb_size, MALLOC_CAP_SPIRAM);
+        if (!s_dbl.buf[i]) dma_ok = false;
+    }
+    if (!dma_ok || !s_jpeg_buf) {
+        ESP_LOGE(TAG, "Frame buffer alloc failed (need %d × %zu B DMA + encoder mem)",
+                 NUM_FRAME_BUFFERS, fb_size);
         return;
     }
     s_dbl.buflen   = fb_size;
-    s_dbl.next_idx = 0;   /* on_get_new_vb gives buf[0] first, then alternates */
+    s_dbl.next_idx = 0;   /* on_get_new_vb gives buf[0] first, then round-robins */
 
-    ESP_LOGI(TAG, "Buffers: DMA[0]=%p DMA[1]=%p send=%p  %zu B each  %dx%d RAW8",
-             s_dbl.buf[0], s_dbl.buf[1], s_send_buf, fb_size,
+    ESP_LOGI(TAG, "Buffers: DMA[0]=%p DMA[1]=%p DMA[2]=%p jpeg=%p  %zu B/frame  %dx%d RGB565",
+             s_dbl.buf[0], s_dbl.buf[1], s_dbl.buf[2], s_jpeg_buf, fb_size,
              CONFIG_EXAMPLE_MIPI_CSI_DISP_HRES, CONFIG_EXAMPLE_MIPI_CSI_DISP_VRES);
 
     /* UDP destination */
@@ -277,8 +350,8 @@ void app_main(void)
         return;
     }
 
-    /* Spawn send task at lower priority (3 < 5 = main task prio) */
-    xTaskCreate(send_task, "send", 4096, &dest, 3, NULL);
+    /* Spawn encode+send task at lower priority (3 < 5 = main task prio) */
+    xTaskCreate(encode_send_task, "enc_send", 4096, &dest, 3, NULL);
 
     /* MIPI PHY power: the CSI D-PHY is powered by an internal LDO channel.
      * Without this the sensor still answers on I2C (SCCB) but NO data ever
@@ -303,13 +376,14 @@ void app_main(void)
     };
     example_sensor_init(&cam_sensor_config, &sensor_handle);
 
-    /* ISP — must be created BEFORE CSI controller, enabled AFTER */
+    /* ISP — must be created BEFORE CSI controller, enabled AFTER.
+     * Demosaics the sensor RAW10 Bayer into packed RGB565 for the encoder. */
     isp_proc_handle_t isp_proc = NULL;
     esp_isp_processor_cfg_t isp_config = {
         .clk_hz                 = 80 * 1000 * 1000,
         .input_data_source      = ISP_INPUT_DATA_SOURCE_CSI,
-        .input_data_color_type  = ISP_COLOR_RAW8,
-        .output_data_color_type = ISP_COLOR_RAW8,
+        .input_data_color_type  = ISP_COLOR_RAW10,
+        .output_data_color_type = ISP_COLOR_RGB565,
         .has_line_start_packet  = false,
         .has_line_end_packet    = false,
         .h_res                  = CONFIG_EXAMPLE_MIPI_CSI_DISP_HRES,
@@ -317,14 +391,19 @@ void app_main(void)
     };
     ESP_ERROR_CHECK(esp_isp_new_processor(&isp_config, &isp_proc));
 
-    /* CSI controller — RAW8 passthrough, double-buffered */
+    /* CSI controller — RAW10 passthrough (input == output).
+     * The CSI bridge's own color conversion only works when src != dst AND on
+     * ESP32-P4 chip rev >= v3.0; this chip is older, so the CSI must bypass and
+     * let the ISP do the RAW10 -> RGB565 demosaic. The frame written to memory
+     * is therefore RGB565 (matches the proven OV5647 test pattern, scaled from
+     * its RAW8 case). */
     esp_cam_ctlr_csi_config_t csi_config = {
         .ctlr_id                = 0,
         .h_res                  = CONFIG_EXAMPLE_MIPI_CSI_DISP_HRES,
         .v_res                  = CONFIG_EXAMPLE_MIPI_CSI_DISP_VRES,
         .lane_bit_rate_mbps     = EXAMPLE_MIPI_CSI_LANE_BITRATE_MBPS,
-        .input_data_color_type  = CAM_CTLR_COLOR_RAW8,
-        .output_data_color_type = CAM_CTLR_COLOR_RAW8,
+        .input_data_color_type  = CAM_CTLR_COLOR_RAW10,
+        .output_data_color_type = CAM_CTLR_COLOR_RAW10,
         .data_lane_num          = 2,
         .byte_swap_en           = false,
         .queue_items            = 2,
@@ -375,9 +454,13 @@ void app_main(void)
         }
 
         if (xSemaphoreTake(s_done, 0) == pdTRUE) {
-            memcpy(s_send_buf, frame_buf, s_dbl.buflen);
-            s_send_len   = s_dbl.buflen;
-            s_send_frame = frame_num;
+            /* Zero-copy: hand the finished DMA buffer straight to the encoder.
+             * Safe because the camera round-robins through 3 buffers, so this
+             * one is not reused until two more frames elapse — long after the
+             * JPEG encode has read it. */
+            s_enc_ptr     = frame_buf;
+            s_enc_len     = s_dbl.buflen;
+            s_send_frame  = frame_num;
             xSemaphoreGive(s_rdy);
             sent_count++;
             ESP_LOGI(TAG, "Frame %" PRIu32 " queued (sent so far: %" PRIu32 ")",

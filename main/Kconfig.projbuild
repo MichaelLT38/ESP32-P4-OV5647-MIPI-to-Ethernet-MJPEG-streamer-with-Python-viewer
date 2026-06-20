@@ -18,22 +18,28 @@ menu "Example Configuration"
 
     choice EXAMPLE_MIPI_CSI_DISP_HRES
         bool "Set MIPI CSI horizontal resolution"
-        default EXAMPLE_MIPI_CSI_HRES_1024
+        default EXAMPLE_MIPI_CSI_HRES_1920
 
         config EXAMPLE_MIPI_CSI_HRES_800
             bool "800"
         config EXAMPLE_MIPI_CSI_HRES_1024
             bool "1024"
+        config EXAMPLE_MIPI_CSI_HRES_1280
+            bool "1280 (960p binning, OV5647 RAW10, low-noise)"
+        config EXAMPLE_MIPI_CSI_HRES_1920
+            bool "1920 (1080p, OV5647 RAW10)"
     endchoice
 
     config EXAMPLE_MIPI_CSI_DISP_HRES
         int
         default 800 if EXAMPLE_MIPI_CSI_HRES_800
         default 1024 if EXAMPLE_MIPI_CSI_HRES_1024
+        default 1280 if EXAMPLE_MIPI_CSI_HRES_1280
+        default 1920 if EXAMPLE_MIPI_CSI_HRES_1920
 
     choice EXAMPLE_MIPI_CSI_DISP_VRES
         bool "Set MIPI CSI vertical resolution"
-        default EXAMPLE_MIPI_CSI_VRES_600
+        default EXAMPLE_MIPI_CSI_VRES_1080
 
         config EXAMPLE_MIPI_CSI_VRES_600
             bool "600"
@@ -41,6 +47,10 @@ menu "Example Configuration"
             bool "640"
         config EXAMPLE_MIPI_CSI_VRES_800
             bool "800"
+        config EXAMPLE_MIPI_CSI_VRES_960
+            bool "960 (binning, low-noise)"
+        config EXAMPLE_MIPI_CSI_VRES_1080
+            bool "1080 (1080p, OV5647 RAW10)"
         config EXAMPLE_MIPI_CSI_VRES_1280
             bool "1280"
     endchoice
@@ -50,5 +60,16 @@ menu "Example Configuration"
         default 600 if EXAMPLE_MIPI_CSI_VRES_600
         default 640 if EXAMPLE_MIPI_CSI_VRES_640
         default 800 if EXAMPLE_MIPI_CSI_VRES_800
+        default 960 if EXAMPLE_MIPI_CSI_VRES_960
+        default 1080 if EXAMPLE_MIPI_CSI_VRES_1080
         default 1280 if EXAMPLE_MIPI_CSI_VRES_1280
+
+    config EXAMPLE_JPEG_QUALITY
+        int "JPEG encode quality (1-100)"
+        default 80
+        range 1 100
+        help
+            Hardware JPEG encoder quality factor. Higher = better image but
+            larger frames / more bandwidth. 80 is a good balance for a
+            1080p MJPEG stream over 100 Mbps Ethernet.
 endmenu

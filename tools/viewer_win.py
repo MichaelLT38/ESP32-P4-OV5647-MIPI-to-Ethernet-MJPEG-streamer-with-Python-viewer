@@ -1,10 +1,15 @@
 """
 ESP32-P4 camera UDP frame viewer (Windows)
-Receives chunked RAW8 (Bayer GBRG) frames and displays them live.
+Receives chunked MJPEG frames (one JPEG per video frame) and displays them live.
+
+The firmware encodes each 1920x1080 frame to JPEG (hardware encoder, 4:2:0)
+and streams the compressed bytes in 1400-byte UDP chunks. This viewer
+reassembles the chunks and decodes the JPEG with OpenCV — no Bayer/debayer
+or resolution handling is needed, the JPEG carries its own dimensions.
 
 Usage:
     pip install opencv-python numpy
-    python viewer_win.py [--port 12345] [--width 800] [--height 640]
+    python viewer_win.py [--port 12345]
 """
 
 import argparse
@@ -25,31 +30,14 @@ except ImportError as e:
 
 # Header layout must match frame_chunk_hdr_t in cam_csi_eth_stream_main.c
 # uint32 frame_num | uint16 chunk_idx | uint16 total_chunks | uint32 frame_bytes | uint32 chunk_bytes
+# frame_bytes is the size of the whole compressed JPEG for this frame.
 HDR_FMT  = "<IHHII"
 HDR_SIZE = struct.calcsize(HDR_FMT)   # 16 bytes
 
-def raw8_to_bgr(data: bytes, width: int, height: int, bayer_code: int) -> np.ndarray:
-    """Debayer RAW8 Bayer data to BGR using OpenCV."""
-    bayer = np.frombuffer(data, dtype=np.uint8).reshape(height, width)
-    return cv2.cvtColor(bayer, bayer_code)
-
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--port",   type=int, default=12345)
-    ap.add_argument("--width",  type=int, default=800)
-    ap.add_argument("--height", type=int, default=640)
-    ap.add_argument("--bayer",  default="BGGR",
-                    choices=["BGGR","RGGB","GBRG","GRBG"],
-                    help="Bayer pattern (OV5647 is BGGR)")
+    ap.add_argument("--port", type=int, default=12345)
     args = ap.parse_args()
-
-    bayer_codes = {
-        "BGGR": cv2.COLOR_BayerBGGR2BGR,
-        "RGGB": cv2.COLOR_BayerRGGB2BGR,
-        "GBRG": cv2.COLOR_BayerGBRG2BGR,
-        "GRBG": cv2.COLOR_BayerGRBG2BGR,
-    }
-    bayer_code = bayer_codes[args.bayer]
 
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -61,7 +49,7 @@ def main():
         sys.exit(1)
 
     log(f"[OK]  Socket bound on 0.0.0.0:{args.port}")
-    log(f"[OK]  Expecting {args.width}x{args.height} RAW8/Bayer frames")
+    log("[OK]  Expecting MJPEG frames (JPEG per frame)")
     log("[..] Waiting for first packet from ESP32...")
     log("     Press Ctrl+C to quit, Q in image window to quit.")
 
@@ -98,19 +86,22 @@ def main():
             for old in [k for k in chunk_buffer if k < frame_num - 4]:
                 del chunk_buffer[old]
 
-            # --- reassemble when all chunks arrived ---
+            # --- reassemble + decode when all chunks arrived ---
             if len(chunk_buffer[frame_num]) == total_chunks:
-                raw = b"".join(chunk_buffer[frame_num][i] for i in range(total_chunks))
+                jpeg = b"".join(chunk_buffer[frame_num][i] for i in range(total_chunks))
                 del chunk_buffer[frame_num]
 
-                expected = args.width * args.height * 1  # RAW8 = 1 byte/pixel
-                if len(raw) != expected:
-                    log(f"[WARN] Frame {frame_num}: size {len(raw)} != {expected}, skipping")
+                if len(jpeg) != frame_bytes:
+                    log(f"[WARN] Frame {frame_num}: size {len(jpeg)} != {frame_bytes}, skipping")
                     continue
 
-                img = raw8_to_bgr(raw, args.width, args.height, bayer_code)
+                img = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR)
+                if img is None:
+                    log(f"[WARN] Frame {frame_num}: JPEG decode failed, skipping")
+                    continue
+
                 cv2.imshow("ESP32-P4 Camera", img)
-                log(f"Frame {frame_num:6d}  {len(raw):,} B  from {addr[0]}")
+                log(f"Frame {frame_num:6d}  {len(jpeg):,} B JPEG  from {addr[0]}")
 
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     break
